@@ -48,7 +48,7 @@ set(EXERCISES
     TriangleTex
     SpherePhong
     CuboIluminacao
-    M2
+    CG
 )
 
 add_compile_options(-Wno-pragmas)
