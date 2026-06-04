@@ -198,7 +198,7 @@ int main()
 #endif
 
     GLFWwindow* janela = glfwCreateWindow(LARGURA, ALTURA,
-        "CG - Iluminacao 3 Pontos", nullptr, nullptr);
+        "CG - Raphael Ferracioli", nullptr, nullptr);
     glfwMakeContextCurrent(janela);
     glfwSetKeyCallback(janela, key_callback);
 
