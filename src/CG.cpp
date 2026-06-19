@@ -1,6 +1,4 @@
 /* Computacao Grafica - Unisinos
- * Iluminacao com tres fontes de luz (three-point lighting)
- *
  * Teclas:
  *   TAB          - troca o objeto selecionado
  *   R / T / S    - ativa modo girar / mover / escalar
@@ -140,22 +138,105 @@ void main()
 )";
 
 // --------------------------------------------------------------------------
+// Estrutura de Trajetoria
+// --------------------------------------------------------------------------
+struct Trajetoria
+{
+    vector<glm::vec3> pontos;      // Waypoints da trajetoria
+    int indiceAtual = 0;            // Indice do proximo ponto de destino
+    float progressao = 0.0f;        // Progressao entre pontos (0.0 a 1.0)
+    float velocidade = 1.0f;        // Unidades por segundo
+    bool ativa = false;             // Se a trajetoria esta em movimento
+
+    void adicionarPonto(glm::vec3 p)
+    {
+        pontos.push_back(p);
+    }
+
+    void limpar()
+    {
+        pontos.clear();
+        indiceAtual = 0;
+        progressao = 0.0f;
+        ativa = false;
+    }
+
+    void iniciar()
+    {
+        if (!pontos.empty())
+        {
+            ativa = true;
+            indiceAtual = 0;
+            progressao = 0.0f;
+        }
+    }
+
+    void parar()
+    {
+        ativa = false;
+    }
+
+    bool estaVazia() const
+    {
+        return pontos.empty();
+    }
+
+    int qtdPontos() const
+    {
+        return (int)pontos.size();
+    }
+
+    // Atualiza a posicao do objeto ao longo da trajetoria
+    glm::vec3 atualizarPosicao(float dt)
+    {
+        if (!ativa || pontos.empty())
+            return glm::vec3(0.0f);
+
+        // Calcula distancia entre o ponto atual e o proximo
+        glm::vec3 pontoAtual = pontos[indiceAtual];
+        glm::vec3 proximoPonto = pontos[(indiceAtual + 1) % pontos.size()];
+        glm::vec3 direcao = proximoPonto - pontoAtual;
+        float distancia = glm::length(direcao);
+
+        if (distancia > 0.001f)
+        {
+            // Incrementa progressao com base na velocidade
+            progressao += (velocidade * dt) / distancia;
+        }
+
+        // Se atingiu o proximo ponto
+        if (progressao >= 1.0f)
+        {
+            indiceAtual = (indiceAtual + 1) % pontos.size();
+            progressao = 0.0f;
+            pontoAtual = pontos[indiceAtual];
+            proximoPonto = pontos[(indiceAtual + 1) % pontos.size()];
+            direcao = proximoPonto - pontoAtual;
+        }
+
+        // Interpola linear entre os pontos
+        return pontoAtual + direcao * progressao;
+    }
+};
+
+// --------------------------------------------------------------------------
 // Estado da aplicacao
 // --------------------------------------------------------------------------
 enum class Modo { IDLE, SPIN, SLIDE, RESIZE };
 
 struct Malha
 {
-    GLuint    id;
-    int       qtdVerts;
-    GLuint    textura;
-    float     ka, kd, ks, brilho;
-    glm::vec3 pos;
-    glm::vec3 esc;
-    glm::vec3 eixo;
-    float     angulo;
-    bool      girando;
-    string    rotulo;
+    GLuint      id;
+    int         qtdVerts;
+    GLuint      textura;
+    float       ka, kd, ks, brilho;
+    glm::vec3   pos;
+    glm::vec3   esc;
+    glm::vec3   eixo;
+    float       angulo;
+    bool        girando;
+    string      rotulo;
+    Trajetoria  trajetoria;        // Trajetoria do objeto
 
     Malha(GLuint id, int qtdVerts, GLuint tex,
           float ka, float kd, float ks, float brilho,
@@ -171,11 +252,13 @@ vector<Malha> cena;
 int           atual        = 0;
 Modo          modo         = Modo::IDLE;
 bool          lucesAtivas[3] = { true, true, true };
+bool          modoEdicaoTraj = false;  // Se estamos editando trajetoria
 
 const float DELTA_POS   = 0.05f;
 const float DELTA_ESC   = 0.1f;
 const float ESC_MINIMA  = 0.05f;
 const float VEL_GIRO    = 1.5f;
+const float VEL_TRAJ    = 1.5f;  // Velocidade da trajetoria (unidades/segundo)
 
 // Recursos do HUD
 GLuint hudShader = 0;
@@ -294,6 +377,12 @@ int main()
             if (cena[i].girando)
                 cena[i].angulo += VEL_GIRO * dt;
 
+            // Atualiza posicao se a trajetoria esta ativa
+            if (cena[i].trajetoria.ativa && !cena[i].trajetoria.estaVazia())
+            {
+                cena[i].pos = cena[i].trajetoria.atualizarPosicao(dt);
+            }
+
             glm::mat4 model = glm::mat4(1.0f);
             model = glm::translate(model, cena[i].pos);
             model = glm::rotate(model,    cena[i].angulo, cena[i].eixo);
@@ -344,6 +433,42 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     if (key == GLFW_KEY_1 && action == GLFW_PRESS) lucesAtivas[0] = !lucesAtivas[0];
     if (key == GLFW_KEY_2 && action == GLFW_PRESS) lucesAtivas[1] = !lucesAtivas[1];
     if (key == GLFW_KEY_3 && action == GLFW_PRESS) lucesAtivas[2] = !lucesAtivas[2];
+
+    // Controles de Trajetoria
+    if (key == GLFW_KEY_M && action == GLFW_PRESS)
+    {
+        modoEdicaoTraj = !modoEdicaoTraj;
+        if (!modoEdicaoTraj)
+            cena[atual].trajetoria.parar();
+    }
+
+    if (modoEdicaoTraj && action == GLFW_PRESS)
+    {
+        if (key == GLFW_KEY_P)  // P - Adicionar ponto na posicao atual
+        {
+            cena[atual].trajetoria.adicionarPonto(cena[atual].pos);
+        }
+        if (key == GLFW_KEY_O)  // O - Iniciar/Parar movimento na trajetoria
+        {
+            if (cena[atual].trajetoria.ativa)
+                cena[atual].trajetoria.parar();
+            else
+                cena[atual].trajetoria.iniciar();
+        }
+        if (key == GLFW_KEY_L)  // L - Limpar trajetoria
+        {
+            cena[atual].trajetoria.limpar();
+        }
+    }
+
+    if (modoEdicaoTraj && (action == GLFW_PRESS || action == GLFW_REPEAT))
+    {
+        // Teclas para ajustar velocidade da trajetoria
+        if (key == GLFW_KEY_EQUAL)  // + para aumentar velocidade
+            cena[atual].trajetoria.velocidade += 0.5f;
+        if (key == GLFW_KEY_MINUS)  // - para diminuir velocidade
+            cena[atual].trajetoria.velocidade = glm::max(0.1f, cena[atual].trajetoria.velocidade - 0.5f);
+    }
 
     if (modo == Modo::SPIN && action == GLFW_PRESS)
     {
@@ -409,6 +534,37 @@ void desenharHUD()
         bool ativa = lucesAtivas[i];
         string luzStr = "[" + to_string(i + 1) + "] " + nomeLuz[i] + ": " + (ativa ? "ON" : "OFF");
         renderText(luzStr, 10, 68 + i * LINHA, TAM, ativa ? corLigada : corApagada);
+    }
+
+    // modo trajetoria ────────────────────────────────────────────────────
+    if (modoEdicaoTraj)
+    {
+        glm::vec3 corTraj = glm::vec3(1.0f, 0.5f, 1.0f);
+        renderText(">> MODO TRAJETORIA [M para sair]", 10, 122, TAM, corTraj);
+
+        int qtdPontos = cena[atual].trajetoria.qtdPontos();
+        bool trajAtiva = cena[atual].trajetoria.ativa;
+        float velTraj = cena[atual].trajetoria.velocidade;
+
+        string trajInfo = "Pontos: " + to_string(qtdPontos) + 
+                         " | Status: " + (trajAtiva ? "MOVENDO" : "PARADA") +
+                         " | Vel: " + to_string((int)(velTraj * 10.0f) / 10.0f);
+        renderText(trajInfo, 10, 140, TAM, glm::vec3(1.0f, 0.8f, 0.2f));
+
+        // Instrucoes de trajetoria
+        const char* ajudaTraj[] = {
+            "P   adicionar ponto na posicao atual",
+            "O   iniciar/parar movimento",
+            "L   limpar trajetoria",
+            "+/- ajustar velocidade"
+        };
+        for (int i = 0; i < 4; i++)
+            renderText(ajudaTraj[i], 10, 158 + i * LINHA, TAM, glm::vec3(0.7f, 0.9f, 1.0f));
+    }
+    else
+    {
+        glm::vec3 corInicio = glm::vec3(0.6f, 0.6f, 0.9f);
+        renderText("[M] Editar trajetoria", 10, 122, TAM, corInicio);
     }
 
     // ajuda no rodape (loop) ─────────────────────────────────────────────
