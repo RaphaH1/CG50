@@ -1,12 +1,28 @@
 /* Computacao Grafica - Unisinos
- * Teclas:
- *   TAB          - troca o objeto selecionado
- *   R / T / S    - ativa modo girar / mover / escalar
- *   X, Y, Z      - define eixo de rotacao (modo girar)
- *   Setas + W/E  - movimenta o objeto (modo mover)
- *   = / -        - aumenta ou diminui o objeto (modo escalar)
- *   1 / 2 / 3    - liga ou desliga cada fonte de luz
- *   ESC          - encerra
+ * Visualizador de cenas 3D
+ *
+ * Camera (primeira pessoa):
+ *   W A S D       - movimenta a camera
+ *   SPACE / SHIFT - sobe / desce a camera
+ *   mouse         - orienta a camera
+ *
+ * Objeto selecionado:
+ *   TAB           - seleciona o proximo objeto da cena
+ *   setas         - translada em X (esq/dir) e em Z (cima/baixo)
+ *   PAGE UP/DOWN  - translada em Y
+ *   X, Y, Z       - liga/desliga a rotacao no respectivo eixo
+ *   [ / ]         - diminui / aumenta a escala (uniforme)
+ *
+ * Iluminacao:
+ *   1, 2, 3       - liga/desliga cada uma das tres luzes
+ *
+ * Trajetoria (curva de Bezier):
+ *   B             - adiciona um ponto de controle na posicao do objeto
+ *   N             - inicia / pausa a animacao
+ *   C             - limpa os pontos de controle
+ *   G             - grava a cena no arquivo de configuracao
+ *
+ *   ESC           - encerra
  */
 
 #include <iostream>
@@ -14,6 +30,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cmath>
 
 using namespace std;
 
@@ -26,21 +43,22 @@ using namespace std;
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-#define STB_EASY_FONT_IMPLEMENTATION
-#include "stb_easy_font.h"
-
 // --------------------------------------------------------------------------
 // Prototipos
 // --------------------------------------------------------------------------
 void   key_callback(GLFWwindow* window, int key, int scancode, int action, int mod);
+void   mouse_callback(GLFWwindow* window, double xpos, double ypos);
+void   processarCamera(GLFWwindow* window, float dt);
 int    setupShader();
-int    setupTextShader();
-void   renderText(const string& str, float x, float y, float tam, glm::vec3 cor);
-void   desenharHUD();
 void   atualizarLuzes(GLuint prog, GLint posLoc[], GLint onLoc[]);
+bool   carregarCena(const string& caminho);
+void   salvarCena(const string& caminho);
 int    carregarOBJ(const string& caminho, int& qtdVerts, GLuint& texID,
                    float& ka, float& kd, float& ks, float& brilho);
 GLuint carregarTextura(const string& caminho);
+GLuint criarTexturaBranca();
+GLuint criarCubo(glm::vec3 corTopo, glm::vec3 corLado, glm::vec3 corBaixo, int& qtdVerts);
+void   gerarChao(int n, float tam);
 
 // --------------------------------------------------------------------------
 // Dimensoes da janela
@@ -48,23 +66,28 @@ GLuint carregarTextura(const string& caminho);
 const GLuint LARGURA = 1000, ALTURA = 1000;
 
 // --------------------------------------------------------------------------
-// Vertex Shader — transforma posicao e passa atributos para o fragment
+// Vertex Shader — aplica model/view/projection e passa atributos ao fragment
 // --------------------------------------------------------------------------
 const GLchar* srcVertPrincipal = R"(
 #version 330
 layout (location = 0) in vec3 posicao;
 layout (location = 1) in vec2 uvCoord;
 layout (location = 2) in vec3 normal;
+layout (location = 3) in vec3 corVertice;
 uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
 out vec2  coordUV;
 out vec3  normalFrag;
 out vec3  posicaoFrag;
+out vec3  corVert;
 void main()
 {
     vec4 posM = model * vec4(posicao, 1.0);
-    gl_Position  = posM;
+    gl_Position  = projection * view * posM;
     posicaoFrag  = vec3(posM);
     coordUV      = uvCoord;
+    corVert      = corVertice;
     normalFrag   = normalize(mat3(transpose(inverse(model))) * normal);
 }
 )";
@@ -75,6 +98,7 @@ const GLchar* srcFragPrincipal = R"(
 in vec2  coordUV;
 in vec3  normalFrag;
 in vec3  posicaoFrag;
+in vec3  corVert;
 uniform sampler2D mapa;
 uniform vec3  posCamera;
 uniform float ka;
@@ -88,7 +112,7 @@ uniform float realce;
 out vec4 fragColor;
 void main()
 {
-    vec3 corBase   = vec3(texture(mapa, coordUV));
+    vec3 corBase   = vec3(texture(mapa, coordUV)) * corVert;
     vec3 norm      = normalize(normalFrag);
     vec3 visao     = normalize(posCamera - posicaoFrag);
 
@@ -102,7 +126,7 @@ void main()
 
         vec3  direcaoLuz  = normalize(lightPos[i] - posicaoFrag);
         float distancia   = length(lightPos[i] - posicaoFrag);
-        float atenuacao   = 1.0 / (1.0 + 0.5 * distancia + 1.0 * distancia * distancia);
+        float atenuacao   = 1.0 / (1.0 + 0.14 * distancia + 0.07 * distancia * distancia);
 
         float fatorDifuso = max(dot(norm, direcaoLuz), 0.0);
         difusa   += kd * fatorDifuso * atenuacao * lightInt[i] * corBase;
@@ -116,58 +140,104 @@ void main()
 }
 )";
 
-// Shaders do sistema de texto 2D (HUD)
-const GLchar* srcVertTexto = R"(
-#version 330
-layout (location = 0) in vec2 posicao;
-uniform mat4 projecao;
-void main()
-{
-    gl_Position = projecao * vec4(posicao, 0.0, 1.0);
-}
-)";
+// --------------------------------------------------------------------------
+// Camera em primeira pessoa
+// --------------------------------------------------------------------------
+enum Movimento { FRENTE, TRAS, ESQUERDA, DIREITA, CIMA, BAIXO };
 
-const GLchar* srcFragTexto = R"(
-#version 330
-uniform vec3 corTexto;
-out vec4 fragColor;
-void main()
+class Camera
 {
-    fragColor = vec4(corTexto, 1.0);
-}
-)";
+public:
+    glm::vec3 posicao;
+    glm::vec3 frente;
+    glm::vec3 cima;
+    glm::vec3 direita;
+    glm::vec3 cimaMundo;
+    float yaw;
+    float pitch;
+    float velocidade;
+    float sensibilidade;
+
+    Camera(glm::vec3 pos = glm::vec3(0.0f, 0.0f, 3.0f),
+           float yawInicial = -90.0f, float pitchInicial = 0.0f)
+        : frente(glm::vec3(0.0f, 0.0f, -1.0f)), velocidade(2.5f), sensibilidade(0.1f)
+    {
+        posicao   = pos;
+        cimaMundo = glm::vec3(0.0f, 1.0f, 0.0f);
+        yaw       = yawInicial;
+        pitch     = pitchInicial;
+        atualizarVetores();
+    }
+
+    glm::mat4 matrizVisao() const
+    {
+        return glm::lookAt(posicao, posicao + frente, cima);
+    }
+
+    void mover(Movimento dir, float dt)
+    {
+        float v = velocidade * dt;
+        if (dir == FRENTE)   posicao += frente    * v;
+        if (dir == TRAS)     posicao -= frente    * v;
+        if (dir == ESQUERDA) posicao -= direita   * v;
+        if (dir == DIREITA)  posicao += direita   * v;
+        if (dir == CIMA)     posicao += cimaMundo * v;
+        if (dir == BAIXO)    posicao -= cimaMundo * v;
+    }
+
+    void girar(float dx, float dy)
+    {
+        yaw   += dx * sensibilidade;
+        pitch += dy * sensibilidade;
+        if (pitch >  89.0f) pitch =  89.0f;
+        if (pitch < -89.0f) pitch = -89.0f;
+        atualizarVetores();
+    }
+
+private:
+    void atualizarVetores()
+    {
+        glm::vec3 f;
+        f.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+        f.y = sin(glm::radians(pitch));
+        f.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+        frente  = glm::normalize(f);
+        direita = glm::normalize(glm::cross(frente, cimaMundo));
+        cima    = glm::normalize(glm::cross(direita, frente));
+    }
+};
 
 // --------------------------------------------------------------------------
-// Estrutura de Trajetoria
+// Estrutura de Trajetoria — curva de Bezier (de Casteljau)
 // --------------------------------------------------------------------------
 struct Trajetoria
 {
-    vector<glm::vec3> pontos;      // Waypoints da trajetoria
-    int indiceAtual = 0;            // Indice do proximo ponto de destino
-    float progressao = 0.0f;        // Progressao entre pontos (0.0 a 1.0)
-    float velocidade = 1.0f;        // Unidades por segundo
-    bool ativa = false;             // Se a trajetoria esta em movimento
+    vector<glm::vec3> controle;     // pontos de controle informados pelo usuario
+    vector<glm::vec3> curva;        // pontos amostrados ao longo da curva de Bezier
+    float parametro = 0.0f;         // parametro de avanco (0.0 a 1.0)
+    float velocidade = 0.2f;        // fracao da curva percorrida por segundo
+    bool ativa = false;             // se a animacao esta em movimento
 
     void adicionarPonto(glm::vec3 p)
     {
-        pontos.push_back(p);
+        controle.push_back(p);
+        gerarCurva();
     }
 
     void limpar()
     {
-        pontos.clear();
-        indiceAtual = 0;
-        progressao = 0.0f;
+        controle.clear();
+        curva.clear();
+        parametro = 0.0f;
         ativa = false;
     }
 
     void iniciar()
     {
-        if (!pontos.empty())
+        if (curva.size() > 1)
         {
             ativa = true;
-            indiceAtual = 0;
-            progressao = 0.0f;
+            parametro = 0.0f;
         }
     }
 
@@ -178,52 +248,59 @@ struct Trajetoria
 
     bool estaVazia() const
     {
-        return pontos.empty();
+        return controle.empty();
     }
 
     int qtdPontos() const
     {
-        return (int)pontos.size();
+        return (int)controle.size();
     }
 
-    // Atualiza a posicao do objeto ao longo da trajetoria
+    // Algoritmo de de Casteljau: avalia a curva de Bezier no parametro t,
+    // interpolando recursivamente os pontos de controle
+    glm::vec3 deCasteljau(float t) const
+    {
+        vector<glm::vec3> tmp = controle;
+        int n = (int)tmp.size();
+        for (int k = 1; k < n; k++)
+            for (int i = 0; i < n - k; i++)
+                tmp[i] = (1.0f - t) * tmp[i] + t * tmp[i + 1];
+        return tmp[0];
+    }
+
+    // Amostra a curva de Bezier numa poligonal densa para a animacao
+    void gerarCurva()
+    {
+        curva.clear();
+        if (controle.size() < 2) return;
+        const int amostras = 200;
+        for (int i = 0; i <= amostras; i++)
+        {
+            float t = (float)i / (float)amostras;
+            curva.push_back(deCasteljau(t));
+        }
+    }
+
+    // Avanca o objeto pela curva de forma ciclica (ao terminar, volta ao inicio)
     glm::vec3 atualizarPosicao(float dt)
     {
-        if (!ativa || pontos.empty())
-            return glm::vec3(0.0f);
+        if (!ativa || curva.size() < 2)
+            return curva.empty() ? glm::vec3(0.0f) : curva.front();
 
-        // Calcula distancia entre o ponto atual e o proximo
-        glm::vec3 pontoAtual = pontos[indiceAtual];
-        glm::vec3 proximoPonto = pontos[(indiceAtual + 1) % pontos.size()];
-        glm::vec3 direcao = proximoPonto - pontoAtual;
-        float distancia = glm::length(direcao);
+        parametro += velocidade * dt;
+        while (parametro >= 1.0f) parametro -= 1.0f;
 
-        if (distancia > 0.001f)
-        {
-            // Incrementa progressao com base na velocidade
-            progressao += (velocidade * dt) / distancia;
-        }
-
-        // Se atingiu o proximo ponto
-        if (progressao >= 1.0f)
-        {
-            indiceAtual = (indiceAtual + 1) % pontos.size();
-            progressao = 0.0f;
-            pontoAtual = pontos[indiceAtual];
-            proximoPonto = pontos[(indiceAtual + 1) % pontos.size()];
-            direcao = proximoPonto - pontoAtual;
-        }
-
-        // Interpola linear entre os pontos
-        return pontoAtual + direcao * progressao;
+        float f = parametro * (float)(curva.size() - 1);
+        int i = (int)f;
+        if (i >= (int)curva.size() - 1) i = (int)curva.size() - 2;
+        float frac = f - (float)i;
+        return curva[i] * (1.0f - frac) + curva[i + 1] * frac;
     }
 };
 
 // --------------------------------------------------------------------------
 // Estado da aplicacao
 // --------------------------------------------------------------------------
-enum class Modo { IDLE, SPIN, SLIDE, RESIZE };
-
 struct Malha
 {
     GLuint      id;
@@ -236,7 +313,8 @@ struct Malha
     float       angulo;
     bool        girando;
     string      rotulo;
-    Trajetoria  trajetoria;        // Trajetoria do objeto
+    string      caminho;           // caminho do .obj (usado ao gravar a cena)
+    Trajetoria  trajetoria;        // trajetoria do objeto
 
     Malha(GLuint id, int qtdVerts, GLuint tex,
           float ka, float kd, float ks, float brilho,
@@ -248,22 +326,43 @@ struct Malha
           angulo(0.0f), girando(false), rotulo(rotulo) {}
 };
 
+// Bloco do chao do diorama (geometria colorida, sem selecao nem trajetoria)
+struct Bloco
+{
+    GLuint    vao;
+    int       qtdVerts;
+    glm::vec3 pos;
+    float     tam;
+};
+
 vector<Malha> cena;
-int           atual        = 0;
-Modo          modo         = Modo::IDLE;
+vector<Bloco> chao;
+GLuint        texBranca = 0;
+int           atual          = 0;
 bool          lucesAtivas[3] = { true, true, true };
-bool          modoEdicaoTraj = false;  // Se estamos editando trajetoria
+float         intensidadeLuz[3] = { 1.2f, 0.5f, 0.7f };
+
+// Material do chao (coeficientes de Phong dos blocos)
+const float CHAO_KA = 0.45f, CHAO_KD = 0.85f, CHAO_KS = 0.08f, CHAO_Q = 8.0f;
+
+// Camera e frustrum
+Camera camera(glm::vec3(0.0f, 0.0f, 3.0f));
+float  fovCamera = 45.0f;
+float  znear     = 0.1f;
+float  zfar      = 100.0f;
+
+// Controle do mouse
+float ultimoX     = LARGURA / 2.0f;
+float ultimoY     = ALTURA  / 2.0f;
+bool  primeiroMouse = true;
+
+// Arquivo de configuracao de cena
+const string ARQUIVO_CENA = "cena.txt";
 
 const float DELTA_POS   = 0.05f;
 const float DELTA_ESC   = 0.1f;
 const float ESC_MINIMA  = 0.05f;
 const float VEL_GIRO    = 1.5f;
-const float VEL_TRAJ    = 1.5f;  // Velocidade da trajetoria (unidades/segundo)
-
-// Recursos do HUD
-GLuint hudShader = 0;
-GLuint hudVAO = 0, hudVBO = 0, hudEBO = 0;
-GLint  hudProj = -1, hudCor = -1;
 
 
 // --------------------------------------------------------------------------
@@ -284,6 +383,8 @@ int main()
         "CG - Raphael Ferracioli", nullptr, nullptr);
     glfwMakeContextCurrent(janela);
     glfwSetKeyCallback(janela, key_callback);
+    glfwSetCursorPosCallback(janela, mouse_callback);
+    glfwSetInputMode(janela, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
     {
@@ -300,6 +401,8 @@ int main()
 
     // Locations dos uniforms do shader principal
     GLint modelLoc     = glGetUniformLocation(prog, "model");
+    GLint viewLoc      = glGetUniformLocation(prog, "view");
+    GLint projLoc      = glGetUniformLocation(prog, "projection");
     GLint mapaLoc      = glGetUniformLocation(prog, "mapa");
     GLint posCamLoc    = glGetUniformLocation(prog, "posCamera");
     GLint kaLoc        = glGetUniformLocation(prog, "ka");
@@ -316,44 +419,26 @@ int main()
         luzOnLoc[i]  = glGetUniformLocation(prog, ("lightOn["  + to_string(i) + "]").c_str());
     }
 
-    glUniform1i(mapaLoc,   0);
-    glUniform3f(posCamLoc, 0.0f, 0.0f, 2.0f);
-
-    float intensidades[3] = { 1.2f, 0.5f, 0.7f };
-    for (int i = 0; i < 3; i++)
-        glUniform1f(luzIntLoc[i], intensidades[i]);
-
-    // Inicializa sistema de HUD
-    hudShader = setupTextShader();
-    glGenVertexArrays(1, &hudVAO);
-    glGenBuffers(1, &hudVBO);
-    glGenBuffers(1, &hudEBO);
-    hudProj = glGetUniformLocation(hudShader, "projecao");
-    hudCor  = glGetUniformLocation(hudShader, "corTexto");
+    glUniform1i(mapaLoc, 0);
 
     glEnable(GL_DEPTH_TEST);
 
-    // Carrega modelos da cena
-    int    nv = 0;
-    GLuint tx = 0;
-    float  ka = 0.2f, kd = 0.7f, ks = 0.5f, brilho = 32.0f;
-
-    GLuint vaoA = (GLuint)carregarOBJ("assets/Modelos3D/Suzanne.obj", nv, tx, ka, kd, ks, brilho);
-    if (vaoA != (GLuint)-1)
-        cena.push_back(Malha(vaoA, nv, tx, ka, kd, ks, brilho, glm::vec3(-0.4f, 0.0f, 0.0f), "Suzanne"));
-
-    ka = 0.2f; kd = 0.7f; ks = 0.5f; brilho = 32.0f;
-    GLuint vaoB = (GLuint)carregarOBJ("assets/Modelos3D/Cube.obj", nv, tx, ka, kd, ks, brilho);
-    if (vaoB != (GLuint)-1)
-        cena.push_back(Malha(vaoB, nv, tx, ka, kd, ks, brilho, glm::vec3(0.4f, 0.0f, 0.0f), "Cubo"));
-
-    if (cena.empty())
+    // Carrega a cena a partir do arquivo de configuracao
+    if (!carregarCena(ARQUIVO_CENA))
     {
-        cout << "Nenhum modelo carregado." << endl;
+        cout << "Nenhum modelo carregado. Verifique o arquivo " << ARQUIVO_CENA << endl;
         glfwTerminate();
         return -1;
     }
 
+    // Envia as intensidades das luzes (definidas no arquivo de configuracao)
+    for (int i = 0; i < 3; i++)
+        glUniform1f(luzIntLoc[i], intensidadeLuz[i]);
+
+    cout << "Cena carregada com " << cena.size() << " objeto(s)." << endl;
+    cout << "Use WASD + mouse para a camera, TAB para selecionar e ESC para sair." << endl;
+
+    float aspecto = (float)fbL / (float)fbA;
     float tAnterior = (float)glfwGetTime();
 
     while (!glfwWindowShouldClose(janela))
@@ -363,6 +448,7 @@ int main()
         tAnterior    = tAtual;
 
         glfwPollEvents();
+        processarCamera(janela, dt);
 
         glClearColor(0.08f, 0.08f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -370,8 +456,34 @@ int main()
         // Atualiza posicoes das luzes e estado on/off
         atualizarLuzes(prog, luzPosLoc, luzOnLoc);
 
-        // Desenha cada malha da cena
         glUseProgram(prog);
+
+        // Matrizes de camera (view) e projecao (frustrum)
+        glm::mat4 view = camera.matrizVisao();
+        glm::mat4 projecao = glm::perspective(glm::radians(fovCamera), aspecto, znear, zfar);
+        glUniformMatrix4fv(viewLoc, 1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(projLoc, 1, GL_FALSE, glm::value_ptr(projecao));
+        glUniform3fv(posCamLoc, 1, glm::value_ptr(camera.posicao));
+
+        // Desenha os blocos do chao (diorama)
+        glUniform1f(kaLoc, CHAO_KA);
+        glUniform1f(kdLoc, CHAO_KD);
+        glUniform1f(ksLoc, CHAO_KS);
+        glUniform1f(qLoc,  CHAO_Q);
+        glUniform1f(realceLoc, 1.0f);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texBranca);
+        for (size_t i = 0; i < chao.size(); i++)
+        {
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, chao[i].pos);
+            model = glm::scale(model, glm::vec3(chao[i].tam));
+            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
+            glBindVertexArray(chao[i].vao);
+            glDrawArrays(GL_TRIANGLES, 0, chao[i].qtdVerts);
+        }
+
+        // Desenha cada malha da cena
         for (int i = 0; i < (int)cena.size(); i++)
         {
             if (cena[i].girando)
@@ -402,11 +514,6 @@ int main()
         }
         glBindVertexArray(0);
 
-        // Sobreposicao do HUD
-        glDisable(GL_DEPTH_TEST);
-        desenharHUD();
-        glEnable(GL_DEPTH_TEST);
-
         glfwSwapBuffers(janela);
     }
 
@@ -423,76 +530,69 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GL_TRUE);
 
+    // Seleciona o proximo objeto da cena
     if (key == GLFW_KEY_TAB && action == GLFW_PRESS)
+    {
         atual = (atual + 1) % (int)cena.size();
+        cout << "Selecionado: " << cena[atual].rotulo << endl;
+    }
 
-    if (key == GLFW_KEY_R && action == GLFW_PRESS) modo = Modo::SPIN;
-    if (key == GLFW_KEY_T && action == GLFW_PRESS) modo = Modo::SLIDE;
-    if (key == GLFW_KEY_S && action == GLFW_PRESS) modo = Modo::RESIZE;
-
+    // Liga/desliga cada uma das tres luzes
     if (key == GLFW_KEY_1 && action == GLFW_PRESS) lucesAtivas[0] = !lucesAtivas[0];
     if (key == GLFW_KEY_2 && action == GLFW_PRESS) lucesAtivas[1] = !lucesAtivas[1];
     if (key == GLFW_KEY_3 && action == GLFW_PRESS) lucesAtivas[2] = !lucesAtivas[2];
 
-    // Controles de Trajetoria
-    if (key == GLFW_KEY_M && action == GLFW_PRESS)
+    // Rotacao do objeto selecionado (liga/desliga em cada eixo)
+    if (action == GLFW_PRESS && (key == GLFW_KEY_X || key == GLFW_KEY_Y || key == GLFW_KEY_Z))
     {
-        modoEdicaoTraj = !modoEdicaoTraj;
-        if (!modoEdicaoTraj)
-            cena[atual].trajetoria.parar();
+        glm::vec3 e = (key == GLFW_KEY_X) ? glm::vec3(1, 0, 0)
+                    : (key == GLFW_KEY_Y) ? glm::vec3(0, 1, 0)
+                                          : glm::vec3(0, 0, 1);
+        Malha& m = cena[atual];
+        if (m.girando && m.eixo == e) m.girando = false;
+        else { m.eixo = e; m.girando = true; }
     }
 
-    if (modoEdicaoTraj && action == GLFW_PRESS)
+    // Trajetoria por curva de Bezier
+    if (action == GLFW_PRESS)
     {
-        if (key == GLFW_KEY_P)  // P - Adicionar ponto na posicao atual
+        if (key == GLFW_KEY_B)   // adiciona ponto de controle na posicao do objeto
         {
             cena[atual].trajetoria.adicionarPonto(cena[atual].pos);
+            cout << "Ponto de controle adicionado ("
+                 << cena[atual].trajetoria.qtdPontos() << ")" << endl;
         }
-        if (key == GLFW_KEY_O)  // O - Iniciar/Parar movimento na trajetoria
+        if (key == GLFW_KEY_N)   // inicia/pausa a animacao
         {
-            if (cena[atual].trajetoria.ativa)
-                cena[atual].trajetoria.parar();
-            else
-                cena[atual].trajetoria.iniciar();
+            if (cena[atual].trajetoria.ativa) cena[atual].trajetoria.parar();
+            else                              cena[atual].trajetoria.iniciar();
         }
-        if (key == GLFW_KEY_L)  // L - Limpar trajetoria
+        if (key == GLFW_KEY_C)   // limpa os pontos de controle
         {
             cena[atual].trajetoria.limpar();
+            cout << "Trajetoria limpa" << endl;
+        }
+        if (key == GLFW_KEY_G)   // grava a cena no arquivo de configuracao
+        {
+            salvarCena(ARQUIVO_CENA);
         }
     }
 
-    if (modoEdicaoTraj && (action == GLFW_PRESS || action == GLFW_REPEAT))
-    {
-        // Teclas para ajustar velocidade da trajetoria
-        if (key == GLFW_KEY_EQUAL)  // + para aumentar velocidade
-            cena[atual].trajetoria.velocidade += 0.5f;
-        if (key == GLFW_KEY_MINUS)  // - para diminuir velocidade
-            cena[atual].trajetoria.velocidade = glm::max(0.1f, cena[atual].trajetoria.velocidade - 0.5f);
-    }
-
-    if (modo == Modo::SPIN && action == GLFW_PRESS)
-    {
-        if (key == GLFW_KEY_X) { cena[atual].eixo = glm::vec3(1,0,0); cena[atual].girando = true; }
-        if (key == GLFW_KEY_Y) { cena[atual].eixo = glm::vec3(0,1,0); cena[atual].girando = true; }
-        if (key == GLFW_KEY_Z) { cena[atual].eixo = glm::vec3(0,0,1); cena[atual].girando = true; }
-    }
-
-    if (modo == Modo::SLIDE && (action == GLFW_PRESS || action == GLFW_REPEAT))
+    // Translacao do objeto selecionado
+    if (action == GLFW_PRESS || action == GLFW_REPEAT)
     {
         glm::vec3& p = cena[atual].pos;
-        if (key == GLFW_KEY_LEFT)  p.x -= DELTA_POS;
-        if (key == GLFW_KEY_RIGHT) p.x += DELTA_POS;
-        if (key == GLFW_KEY_UP)    p.y += DELTA_POS;
-        if (key == GLFW_KEY_DOWN)  p.y -= DELTA_POS;
-        if (key == GLFW_KEY_W) p.z = glm::max(p.z - DELTA_POS, -0.5f);
-        if (key == GLFW_KEY_E) p.z = glm::min(p.z + DELTA_POS,  0.5f);
-    }
+        if (key == GLFW_KEY_LEFT)      p.x -= DELTA_POS;
+        if (key == GLFW_KEY_RIGHT)     p.x += DELTA_POS;
+        if (key == GLFW_KEY_UP)        p.z -= DELTA_POS;
+        if (key == GLFW_KEY_DOWN)      p.z += DELTA_POS;
+        if (key == GLFW_KEY_PAGE_UP)   p.y += DELTA_POS;
+        if (key == GLFW_KEY_PAGE_DOWN) p.y -= DELTA_POS;
 
-    if (modo == Modo::RESIZE && (action == GLFW_PRESS || action == GLFW_REPEAT))
-    {
+        // Escala uniforme do objeto selecionado
         glm::vec3& e = cena[atual].esc;
-        if (key == GLFW_KEY_EQUAL) e += glm::vec3(DELTA_ESC);
-        if (key == GLFW_KEY_MINUS)
+        if (key == GLFW_KEY_RIGHT_BRACKET) e += glm::vec3(DELTA_ESC);
+        if (key == GLFW_KEY_LEFT_BRACKET)
         {
             e -= glm::vec3(DELTA_ESC);
             if (e.x < ESC_MINIMA) e = glm::vec3(ESC_MINIMA);
@@ -502,98 +602,56 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 
 
 // --------------------------------------------------------------------------
-// Desenha o HUD na tela
+// Callback do mouse — orienta a camera
 // --------------------------------------------------------------------------
-void desenharHUD()
+void mouse_callback(GLFWwindow* window, double xpos, double ypos)
 {
-    const float TAM    = 2.0f;
-    const float LINHA  = 18.0f;
-
-    // objeto selecionado (centralizado no topo) ──────────────────────────
-    string titulo = "< " + cena[atual].rotulo + " >";
-    float xCentro = (LARGURA - titulo.size() * 6.0f * TAM * 0.5f) * 0.5f;
-    renderText(titulo, xCentro, 12, TAM, glm::vec3(1.0f, 1.0f, 0.8f));
-
-    // modo ativo (lookup por indice, sem switch) ─────────────────────────
-    const char* descModo[] = { "Inativo", "Girando (X/Y/Z)", "Movendo (setas | W/E)", "Escalando (= / -)" };
-    glm::vec3   corModo[]  = {
-        glm::vec3(0.5f,  0.5f,  0.5f),
-        glm::vec3(1.0f,  0.75f, 0.1f),
-        glm::vec3(0.2f,  1.0f,  0.45f),
-        glm::vec3(0.35f, 0.6f,  1.0f)
-    };
-    int idx = (int)modo;
-    renderText(string(">> ") + descModo[idx], 10, 40, TAM, corModo[idx]);
-
-    // estado das luzes (loop) ────────────────────────────────────────────
-    const char* nomeLuz[] = { "Principal", "Enchimento", "Contra-luz" };
-    glm::vec3 corLigada  = glm::vec3(0.25f, 1.0f,  0.45f);
-    glm::vec3 corApagada = glm::vec3(0.38f, 0.38f, 0.38f);
-    for (int i = 0; i < 3; i++)
+    if (primeiroMouse)
     {
-        bool ativa = lucesAtivas[i];
-        string luzStr = "[" + to_string(i + 1) + "] " + nomeLuz[i] + ": " + (ativa ? "ON" : "OFF");
-        renderText(luzStr, 10, 68 + i * LINHA, TAM, ativa ? corLigada : corApagada);
+        ultimoX = (float)xpos;
+        ultimoY = (float)ypos;
+        primeiroMouse = false;
     }
 
-    // modo trajetoria ────────────────────────────────────────────────────
-    if (modoEdicaoTraj)
-    {
-        glm::vec3 corTraj = glm::vec3(1.0f, 0.5f, 1.0f);
-        renderText(">> MODO TRAJETORIA [M para sair]", 10, 122, TAM, corTraj);
+    float dx = (float)xpos - ultimoX;
+    float dy = ultimoY - (float)ypos;   // invertido: y cresce para baixo na tela
+    ultimoX = (float)xpos;
+    ultimoY = (float)ypos;
 
-        int qtdPontos = cena[atual].trajetoria.qtdPontos();
-        bool trajAtiva = cena[atual].trajetoria.ativa;
-        float velTraj = cena[atual].trajetoria.velocidade;
-
-        string trajInfo = "Pontos: " + to_string(qtdPontos) + 
-                         " | Status: " + (trajAtiva ? "MOVENDO" : "PARADA") +
-                         " | Vel: " + to_string((int)(velTraj * 10.0f) / 10.0f);
-        renderText(trajInfo, 10, 140, TAM, glm::vec3(1.0f, 0.8f, 0.2f));
-
-        // Instrucoes de trajetoria
-        const char* ajudaTraj[] = {
-            "P   adicionar ponto na posicao atual",
-            "O   iniciar/parar movimento",
-            "L   limpar trajetoria",
-            "+/- ajustar velocidade"
-        };
-        for (int i = 0; i < 4; i++)
-            renderText(ajudaTraj[i], 10, 158 + i * LINHA, TAM, glm::vec3(0.7f, 0.9f, 1.0f));
-    }
-    else
-    {
-        glm::vec3 corInicio = glm::vec3(0.6f, 0.6f, 0.9f);
-        renderText("[M] Editar trajetoria", 10, 122, TAM, corInicio);
-    }
-
-    // ajuda no rodape (loop) ─────────────────────────────────────────────
-    const char* ajuda[] = {
-        "TAB    trocar objeto",
-        "R / T / S    girar / mover / escalar",
-        "1 / 2 / 3    alternar luzes",
-        "ESC    encerrar"
-    };
-    int nLinhas   = 4;
-    float yInicio = ALTURA - nLinhas * LINHA - 14.0f;
-    glm::vec3 corAjuda = glm::vec3(0.58f, 0.58f, 0.58f);
-    for (int i = 0; i < nLinhas; i++)
-        renderText(ajuda[i], 10, yInicio + i * LINHA, TAM, corAjuda);
+    camera.girar(dx, dy);
 }
 
 
 // --------------------------------------------------------------------------
-// Atualiza posicao e estado das tres luzes no shader
+// Movimentacao da camera (lida a cada quadro para um movimento suave)
+// --------------------------------------------------------------------------
+void processarCamera(GLFWwindow* window, float dt)
+{
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) camera.mover(FRENTE,  dt);
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) camera.mover(TRAS,    dt);
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) camera.mover(ESQUERDA, dt);
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) camera.mover(DIREITA, dt);
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)      camera.mover(CIMA, dt);
+    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) camera.mover(BAIXO, dt);
+}
+
+
+// --------------------------------------------------------------------------
+// Atualiza posicao e estado das tres luzes no shader.
+// As luzes sao posicionadas automaticamente a partir do objeto principal
+// (cena[0]) seguindo a tecnica de iluminacao de tres pontos.
 // --------------------------------------------------------------------------
 void atualizarLuzes(GLuint prog, GLint posLoc[], GLint onLoc[])
 {
+    // Posiciona as tres luzes a partir do objeto principal (cena[0]).
+    // As distancias sao calibradas para iluminar o objeto e a area do mapa
+    // ao seu redor, seguindo a tecnica de iluminacao de tres pontos.
     glm::vec3 ref = cena[0].pos;
-    float     mag = glm::length(cena[0].esc);
 
     glm::vec3 posicoes[3] = {
-        ref + glm::vec3(-mag * 1.5f,  mag * 1.5f,  mag * 2.5f),
-        ref + glm::vec3( mag * 1.5f,  mag * 0.5f,  mag * 2.5f),
-        ref + glm::vec3( 0.0f,         mag * 1.0f, -mag * 2.5f)
+        ref + glm::vec3(-1.5f, 2.0f,  1.5f),  // principal (key)
+        ref + glm::vec3( 1.5f, 1.2f,  1.2f),  // preenchimento (fill)
+        ref + glm::vec3( 0.0f, 2.0f, -2.0f)   // contra-luz (back)
     };
 
     glUseProgram(prog);
@@ -602,50 +660,6 @@ void atualizarLuzes(GLuint prog, GLint posLoc[], GLint onLoc[])
         glUniform3fv(posLoc[i], 1, glm::value_ptr(posicoes[i]));
         glUniform1i(onLoc[i], lucesAtivas[i] ? 1 : 0);
     }
-}
-
-
-// --------------------------------------------------------------------------
-// Renderiza texto 2D usando stb_easy_font
-// --------------------------------------------------------------------------
-void renderText(const string& str, float x, float y, float tam, glm::vec3 cor)
-{
-    static char buf[99999];
-    int nQuads = stb_easy_font_print(0, 0, (char*)str.c_str(), nullptr, buf, sizeof(buf));
-
-    int nVerts = nQuads * 4;
-    vector<float> verts(nVerts * 2);
-    for (int i = 0; i < nVerts; i++)
-    {
-        float* src = (float*)(buf + i * 16);
-        verts[i * 2 + 0] = src[0] * tam + x;
-        verts[i * 2 + 1] = src[1] * tam + y;
-    }
-
-    vector<unsigned int> idx;
-    idx.reserve(nQuads * 6);
-    for (int q = 0; q < nQuads; q++)
-    {
-        int b = q * 4;
-        idx.push_back(b+0); idx.push_back(b+1); idx.push_back(b+2);
-        idx.push_back(b+0); idx.push_back(b+2); idx.push_back(b+3);
-    }
-
-    glm::mat4 proj = glm::ortho(0.0f, (float)LARGURA, (float)ALTURA, 0.0f, -1.0f, 1.0f);
-
-    glUseProgram(hudShader);
-    glUniformMatrix4fv(hudProj, 1, GL_FALSE, glm::value_ptr(proj));
-    glUniform3fv(hudCor,  1, glm::value_ptr(cor));
-
-    glBindVertexArray(hudVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, hudVBO);
-    glBufferData(GL_ARRAY_BUFFER, verts.size() * sizeof(float), verts.data(), GL_DYNAMIC_DRAW);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (GLvoid*)0);
-    glEnableVertexAttribArray(0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, hudEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * sizeof(unsigned int), idx.data(), GL_DYNAMIC_DRAW);
-    glDrawElements(GL_TRIANGLES, (GLsizei)idx.size(), GL_UNSIGNED_INT, 0);
-    glBindVertexArray(0);
 }
 
 
@@ -667,17 +681,6 @@ int setupShader()
 {
     GLuint vs   = compilarShader(GL_VERTEX_SHADER,   srcVertPrincipal);
     GLuint fs   = compilarShader(GL_FRAGMENT_SHADER, srcFragPrincipal);
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs); glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    glDeleteShader(vs); glDeleteShader(fs);
-    return prog;
-}
-
-int setupTextShader()
-{
-    GLuint vs   = compilarShader(GL_VERTEX_SHADER,   srcVertTexto);
-    GLuint fs   = compilarShader(GL_FRAGMENT_SHADER, srcFragTexto);
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vs); glAttachShader(prog, fs);
     glLinkProgram(prog);
@@ -718,6 +721,138 @@ GLuint carregarTextura(const string& caminho)
     stbi_image_free(pixels);
     glBindTexture(GL_TEXTURE_2D, 0);
     return id;
+}
+
+
+// --------------------------------------------------------------------------
+// Cria uma textura 1x1 branca, usada nos objetos coloridos sem mapa de textura
+// (a cor final vem do atributo de cor do vertice)
+// --------------------------------------------------------------------------
+GLuint criarTexturaBranca()
+{
+    GLuint id;
+    glGenTextures(1, &id);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    unsigned char branco[] = { 255, 255, 255, 255 };
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, branco);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return id;
+}
+
+
+// --------------------------------------------------------------------------
+// Cria um cubo (lado 1, centrado na origem) com cor por face:
+// topo, laterais e base podem receber cores diferentes.
+// Layout do vertice: posicao(3) + uv(2) + normal(3) + cor(3) = 11 floats
+// --------------------------------------------------------------------------
+GLuint criarCubo(glm::vec3 corTopo, glm::vec3 corLado, glm::vec3 corBaixo, int& qtdVerts)
+{
+    const float h = 0.5f;
+
+    struct Face { glm::vec3 n; glm::vec3 c[4]; glm::vec3 cor; };
+    glm::vec3 cT = corTopo, cL = corLado, cB = corBaixo;
+
+    Face faces[6] = {
+        // frente (+z)
+        { { 0, 0, 1}, { {-h,-h, h}, { h,-h, h}, { h, h, h}, {-h, h, h} }, cL },
+        // tras (-z)
+        { { 0, 0,-1}, { { h,-h,-h}, {-h,-h,-h}, {-h, h,-h}, { h, h,-h} }, cL },
+        // esquerda (-x)
+        { {-1, 0, 0}, { {-h,-h,-h}, {-h,-h, h}, {-h, h, h}, {-h, h,-h} }, cL },
+        // direita (+x)
+        { { 1, 0, 0}, { { h,-h, h}, { h,-h,-h}, { h, h,-h}, { h, h, h} }, cL },
+        // topo (+y)
+        { { 0, 1, 0}, { {-h, h, h}, { h, h, h}, { h, h,-h}, {-h, h,-h} }, cT },
+        // base (-y)
+        { { 0,-1, 0}, { {-h,-h,-h}, { h,-h,-h}, { h,-h, h}, {-h,-h, h} }, cB }
+    };
+
+    glm::vec2 uvs[4] = { {0,0}, {1,0}, {1,1}, {0,1} };
+    int tri[6] = { 0, 1, 2, 0, 2, 3 };
+
+    vector<GLfloat> dados;
+    for (int f = 0; f < 6; f++)
+    {
+        for (int k = 0; k < 6; k++)
+        {
+            int v = tri[k];
+            glm::vec3 p = faces[f].c[v];
+            glm::vec2 t = uvs[v];
+            glm::vec3 n = faces[f].n;
+            glm::vec3 c = faces[f].cor;
+            dados.push_back(p.x); dados.push_back(p.y); dados.push_back(p.z);
+            dados.push_back(t.x); dados.push_back(t.y);
+            dados.push_back(n.x); dados.push_back(n.y); dados.push_back(n.z);
+            dados.push_back(c.r); dados.push_back(c.g); dados.push_back(c.b);
+        }
+    }
+
+    GLuint VBO, VAO;
+    glGenBuffers(1, &VBO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, dados.size() * sizeof(GLfloat), dados.data(), GL_STATIC_DRAW);
+
+    glGenVertexArrays(1, &VAO);
+    glBindVertexArray(VAO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)(5 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)(8 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(3);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+
+    qtdVerts = 36;
+    return VAO;
+}
+
+
+// --------------------------------------------------------------------------
+// Gera o chao do diorama: um tabuleiro n x n de blocos de grama (topo verde,
+// laterais de terra) centrado na origem, com o topo no plano y = 0, cercado
+// por uma borda de blocos de pedra um nivel acima.
+// --------------------------------------------------------------------------
+void gerarChao(int n, float tam)
+{
+    if (texBranca == 0) texBranca = criarTexturaBranca();
+
+    int nv = 0;
+    // Tres tons de verde para dar variacao natural a grama
+    GLuint grama[3];
+    grama[0] = criarCubo(glm::vec3(0.28f, 0.62f, 0.22f), glm::vec3(0.45f, 0.32f, 0.18f), glm::vec3(0.28f, 0.20f, 0.10f), nv);
+    grama[1] = criarCubo(glm::vec3(0.34f, 0.68f, 0.26f), glm::vec3(0.47f, 0.34f, 0.20f), glm::vec3(0.28f, 0.20f, 0.10f), nv);
+    grama[2] = criarCubo(glm::vec3(0.24f, 0.56f, 0.18f), glm::vec3(0.43f, 0.30f, 0.16f), glm::vec3(0.28f, 0.20f, 0.10f), nv);
+
+    int nvP = 0;
+    GLuint pedra = criarCubo(glm::vec3(0.58f, 0.58f, 0.60f), glm::vec3(0.46f, 0.46f, 0.50f), glm::vec3(0.34f, 0.34f, 0.38f), nvP);
+
+    float meio = (n - 1) / 2.0f;
+
+    // Campo de grama (topo em y = 0)
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+        {
+            glm::vec3 p((i - meio) * tam, -tam * 0.5f, (j - meio) * tam);
+            int t = (i * 7 + j * 3) % 3;
+            chao.push_back({ grama[t], nv, p, tam });
+        }
+
+    // Borda de pedra um nivel acima, ao redor do campo
+    for (int i = -1; i <= n; i++)
+        for (int j = -1; j <= n; j++)
+        {
+            bool borda = (i == -1 || i == n || j == -1 || j == n);
+            if (!borda) continue;
+            glm::vec3 p((i - meio) * tam, tam * 0.5f, (j - meio) * tam);
+            chao.push_back({ pedra, nvP, p, tam });
+        }
 }
 
 
@@ -829,6 +964,8 @@ int carregarOBJ(const string& caminho, int& qtdVerts, GLuint& texID,
                     dadosVertices.push_back(p.x); dadosVertices.push_back(p.y); dadosVertices.push_back(p.z);
                     dadosVertices.push_back(t.s); dadosVertices.push_back(t.t);
                     dadosVertices.push_back(n.x); dadosVertices.push_back(n.y); dadosVertices.push_back(n.z);
+                    // cor branca: a cor final vem da textura (corBase = textura * corVertice)
+                    dadosVertices.push_back(1.0f); dadosVertices.push_back(1.0f); dadosVertices.push_back(1.0f);
                 }
             }
         }
@@ -849,18 +986,183 @@ int carregarOBJ(const string& caminho, int& qtdVerts, GLuint& texID,
     glBindVertexArray(VAO);
 
     // posicao (x, y, z)
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(GLfloat), (GLvoid*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)0);
     glEnableVertexAttribArray(0);
     // coordenada UV (s, t)
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)(3 * sizeof(GLfloat)));
     glEnableVertexAttribArray(1);
     // normal (nx, ny, nz)
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(GLfloat), (GLvoid*)(5 * sizeof(GLfloat)));
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)(5 * sizeof(GLfloat)));
     glEnableVertexAttribArray(2);
+    // cor (r, g, b)
+    glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(GLfloat), (GLvoid*)(8 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(3);
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 
-    qtdVerts = (int)(dadosVertices.size() / 8);
+    qtdVerts = (int)(dadosVertices.size() / 11);
     return VAO;
+}
+
+
+// --------------------------------------------------------------------------
+// Extrai o nome do arquivo, sem diretorio e sem extensao
+// --------------------------------------------------------------------------
+static string nomeBase(const string& caminho)
+{
+    size_t s = caminho.find_last_of("/\\");
+    string nome = (s == string::npos) ? caminho : caminho.substr(s + 1);
+    size_t d = nome.find_last_of('.');
+    if (d != string::npos) nome = nome.substr(0, d);
+    return nome;
+}
+
+
+// --------------------------------------------------------------------------
+// Leitura do arquivo de configuracao de cena
+// Formato (uma diretiva por linha, # inicia comentario):
+//   camera  px py pz  yaw pitch  fov near far
+//   luz     indice  intensidade  ligada(0/1)
+//   objeto  caminho.obj  px py pz  ex ey ez anguloGraus  escala
+//   traj    px py pz                 (ponto de controle do ultimo objeto)
+//   veltraj velocidade               (velocidade da trajetoria do ultimo objeto)
+// --------------------------------------------------------------------------
+bool carregarCena(const string& caminho)
+{
+    ifstream arq(caminho.c_str());
+    if (!arq.is_open())
+    {
+        cerr << "Nao foi possivel abrir o arquivo de cena: " << caminho << endl;
+        return false;
+    }
+
+    string linha;
+    int ultimoObj = -1;
+
+    while (getline(arq, linha))
+    {
+        size_t c = linha.find('#');
+        if (c != string::npos) linha = linha.substr(0, c);
+
+        istringstream ss(linha);
+        string tipo;
+        if (!(ss >> tipo)) continue;
+
+        if (tipo == "camera")
+        {
+            glm::vec3 p;
+            float yaw, pitch;
+            ss >> p.x >> p.y >> p.z >> yaw >> pitch >> fovCamera >> znear >> zfar;
+            camera = Camera(p, yaw, pitch);
+        }
+        else if (tipo == "luz")
+        {
+            int idx, on;
+            float inten;
+            ss >> idx >> inten >> on;
+            if (idx >= 0 && idx < 3)
+            {
+                intensidadeLuz[idx] = inten;
+                lucesAtivas[idx] = (on != 0);
+            }
+        }
+        else if (tipo == "objeto")
+        {
+            string arquivo;
+            glm::vec3 p, eixo;
+            float ang, escala;
+            ss >> arquivo >> p.x >> p.y >> p.z
+               >> eixo.x >> eixo.y >> eixo.z >> ang >> escala;
+
+            int nv = 0;
+            GLuint tx = 0;
+            float ka = 0.2f, kd = 0.7f, ks = 0.5f, brilho = 32.0f;
+            GLuint vao = (GLuint)carregarOBJ(arquivo, nv, tx, ka, kd, ks, brilho);
+            if (vao != (GLuint)-1)
+            {
+                Malha m(vao, nv, tx, ka, kd, ks, brilho, p, nomeBase(arquivo));
+                m.esc     = glm::vec3(escala);
+                m.angulo  = glm::radians(ang);
+                m.caminho = arquivo;
+                if (glm::length(eixo) > 0.0f) m.eixo = glm::normalize(eixo);
+                cena.push_back(m);
+                ultimoObj = (int)cena.size() - 1;
+            }
+        }
+        else if (tipo == "traj")
+        {
+            glm::vec3 p;
+            ss >> p.x >> p.y >> p.z;
+            if (ultimoObj >= 0) cena[ultimoObj].trajetoria.adicionarPonto(p);
+        }
+        else if (tipo == "veltraj")
+        {
+            float v;
+            ss >> v;
+            if (ultimoObj >= 0) cena[ultimoObj].trajetoria.velocidade = v;
+        }
+        else if (tipo == "chao")
+        {
+            int n;
+            float tam;
+            ss >> n >> tam;
+            gerarChao(n, tam);
+        }
+    }
+    arq.close();
+
+    // Inicia automaticamente as trajetorias predefinidas
+    for (size_t i = 0; i < cena.size(); i++)
+        if (!cena[i].trajetoria.estaVazia())
+            cena[i].trajetoria.iniciar();
+
+    return !cena.empty();
+}
+
+
+// --------------------------------------------------------------------------
+// Gravacao do estado atual da cena no arquivo de configuracao
+// --------------------------------------------------------------------------
+void salvarCena(const string& caminho)
+{
+    ofstream o(caminho.c_str());
+    if (!o.is_open())
+    {
+        cerr << "Nao foi possivel gravar o arquivo de cena: " << caminho << endl;
+        return;
+    }
+
+    o << "# Arquivo de configuracao de cena\n";
+    o << "# camera  px py pz  yaw pitch  fov near far\n";
+    o << "camera " << camera.posicao.x << " " << camera.posicao.y << " " << camera.posicao.z
+      << " " << camera.yaw << " " << camera.pitch
+      << " " << fovCamera << " " << znear << " " << zfar << "\n\n";
+
+    o << "# luz  indice  intensidade  ligada\n";
+    for (int i = 0; i < 3; i++)
+        o << "luz " << i << " " << intensidadeLuz[i] << " " << (lucesAtivas[i] ? 1 : 0) << "\n";
+    o << "\n";
+
+    o << "# objeto  caminho  px py pz  ex ey ez anguloGraus  escala\n";
+    for (size_t i = 0; i < cena.size(); i++)
+    {
+        Malha& m = cena[i];
+        o << "objeto " << m.caminho << " "
+          << m.pos.x << " " << m.pos.y << " " << m.pos.z << " "
+          << m.eixo.x << " " << m.eixo.y << " " << m.eixo.z << " "
+          << glm::degrees(m.angulo) << " " << m.esc.x << "\n";
+
+        for (size_t j = 0; j < m.trajetoria.controle.size(); j++)
+        {
+            glm::vec3 p = m.trajetoria.controle[j];
+            o << "traj " << p.x << " " << p.y << " " << p.z << "\n";
+        }
+        if (!m.trajetoria.controle.empty())
+            o << "veltraj " << m.trajetoria.velocidade << "\n";
+        o << "\n";
+    }
+
+    o.close();
+    cout << "Cena gravada em " << caminho << endl;
 }

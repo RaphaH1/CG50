@@ -1,0 +1,26 @@
+# Arquivo de configuracao de cena - diorama
+# camera  px py pz  yaw pitch  fov near far
+camera 0.0 1.8 3.0 -90.0 -28.0 45.0 0.1 100.0
+
+# luz  indice  intensidade  ligada
+luz 0 1.4 1
+luz 1 0.6 1
+luz 2 0.8 1
+
+# chao  n  tamanhoBloco  (tabuleiro n x n de grama com borda de pedra)
+chao 11 0.2
+
+# objeto  caminho  px py pz  ex ey ez anguloGraus  escala
+# Suzanne andando por uma trajetoria de Bezier no meio do mapa
+objeto assets/Modelos3D/Suzanne.obj -0.8 0.22 0.0 0 1 0 0 0.18
+traj -0.8 0.22  0.0
+traj -0.3 0.22 -0.7
+traj  0.4 0.22 -0.6
+traj  0.8 0.22  0.1
+traj  0.3 0.22  0.7
+traj -0.4 0.22  0.6
+traj -0.8 0.22  0.0
+veltraj 0.1
+
+# Segunda Suzanne parada sobre a grama (selecionavel para transformacoes)
+objeto assets/Modelos3D/SuzanneSubdiv1.obj 0.7 0.22 0.6 0 1 0 0 0.2
